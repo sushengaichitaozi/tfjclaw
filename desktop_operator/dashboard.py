@@ -66,6 +66,7 @@ class AgentDashboard:
         self.event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.runner: AgentRunner | None = None
         self.worker: threading.Thread | None = None
+        self.doctor_worker: threading.Thread | None = None
         self.current_run_dir = ""
         self.current_screenshot_path = ""
         self.run_history_map: list[Path] = []
@@ -101,7 +102,7 @@ class AgentDashboard:
         self._build_layout()
         self._load_config_summary()
         self.root.after(200, self._drain_events)
-        self.root.after(350, self.run_doctor)
+        self._schedule_initial_doctor()
 
     def _configure_fonts(self) -> None:
         tkfont.nametofont("TkDefaultFont").configure(family="Segoe UI", size=10)
@@ -370,7 +371,7 @@ class AgentDashboard:
         tk.Label(card, text=subtitle, bg=PALETTE["surface"], fg=PALETTE["muted"], font=self.meta_font, wraplength=240, justify=tk.LEFT).grid(row=3, column=0, sticky="w", padx=12, pady=(6, 12))
         return card
 
-    def _load_config_summary(self) -> None:
+    def _load_config_summary(self, sync_controls: bool = True) -> None:
         try:
             config = self._load_config()
         except Exception as exc:
@@ -378,26 +379,31 @@ class AgentDashboard:
             self.base_url_var.set("<error>")
             self.api_status_var.set(str(exc))
             return
+        self._apply_config_summary(config, sync_controls=sync_controls)
+
+    def _apply_config_summary(self, config: AgentConfig, sync_controls: bool) -> None:
         self.model_var.set(config.model or "<missing>")
         self.base_url_var.set(config.base_url or "<OpenAI default>")
         self.api_status_var.set("Configured" if config.api_key else "Missing key")
         self.trust_env_var.set("Inherit system proxy" if config.openai_trust_env else "Ignore system proxy")
-        self.allow_shell_var.set(config.allow_shell_launch)
-        self.dry_run_var.set(config.dry_run)
-        self.max_steps_var.set(config.max_steps)
-        self.browser_strategy_var.set(
-            "reuse" if config.prefer_existing_browser_window else "managed"
-        )
+        if sync_controls:
+            self.allow_shell_var.set(config.allow_shell_launch)
+            self.dry_run_var.set(config.dry_run)
+            self.max_steps_var.set(config.max_steps)
+            self.browser_strategy_var.set(
+                "reuse" if config.prefer_existing_browser_window else "managed"
+            )
         self.admin_status_var.set("Administrator" if self._is_admin() else "Standard user")
         self.refresh_recent_runs()
 
-    def reload_env(self) -> None:
+    def reload_env(self, log_change: bool = True) -> None:
         browser_strategy = self.browser_strategy_var.get()
         self.env_file = Path(self.env_entry.get().strip() or self.env_file)
         self._load_config_summary()
         if browser_strategy in {"reuse", "managed"}:
             self.browser_strategy_var.set(browser_strategy)
-        self._append_log(f"[run] reloaded env from {self.env_file}")
+        if log_change:
+            self._append_log(f"[run] reloaded env from {self.env_file}")
 
     def apply_template(self, template: str) -> None:
         self.task_text.delete("1.0", tk.END)
@@ -425,11 +431,15 @@ class AgentDashboard:
         if self.worker is not None and self.worker.is_alive():
             messagebox.showinfo("Agent running", "A run is already in progress.")
             return
+        if self._doctor_running():
+            messagebox.showinfo("Doctor running", "Wait for doctor to finish before starting the agent.")
+            return
         task = self.task_text.get("1.0", tk.END).strip()
         if not task:
             messagebox.showerror("Missing task", "Enter a task before starting the agent.")
             return
         self.env_file = Path(self.env_entry.get().strip() or self.env_file)
+        self._load_config_summary(sync_controls=False)
         self.current_run_dir = ""
         self.current_screenshot_path = ""
         self.run_dir_var.set("-")
@@ -486,42 +496,27 @@ class AgentDashboard:
         if hasattr(os, "startfile"):
             os.startfile(self.current_screenshot_path)
 
-    def run_doctor(self) -> None:
+    def run_doctor(self, auto: bool = False) -> None:
         if self.worker is not None and self.worker.is_alive():
-            messagebox.showinfo("Agent running", "Stop the current run before running doctor.")
+            if not auto:
+                messagebox.showinfo("Agent running", "Stop the current run before running doctor.")
             return
-        self.reload_env()
+        if self._doctor_running():
+            if not auto:
+                messagebox.showinfo("Doctor running", "Doctor is already in progress.")
+            return
+        self.reload_env(log_change=not auto)
         self._set_status("Running doctor", "Capturing the desktop and checking browser, OCR, and UI Automation.")
         self.progress.start(12)
-        self.root.update_idletasks()
-        try:
-            config = self._load_config()
-            run_dir = config.runs_dir / f"doctor_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            runtime = AgentRuntime(config=config, run_dir=run_dir)
-            observation = runtime.capture_observation(step=0)
-            report = runtime.doctor_report()
-        except Exception as exc:
-            self.progress.stop()
-            self._set_status("Doctor failed", str(exc))
-            self._append_log(f"[error] doctor failed: {exc}")
-            messagebox.showerror("Doctor failed", str(exc))
-            return
-        self.progress.stop()
-        self.current_run_dir = str(run_dir)
-        self.current_screenshot_path = str(observation.screenshot_path)
-        self.run_dir_var.set(self.current_run_dir)
-        self.step_var.set("doctor")
-        self.active_window_var.set(report["desktop"].get("active_window") or "<none>")
-        self._replace_window_list(report["desktop"].get("visible_windows", []))
-        self._render_screenshot(self.current_screenshot_path)
-        desktop = report["desktop"]
-        self.desktop_status_var.set(f"Ready {desktop.get('screen_width', '?')}x{desktop.get('screen_height', '?')}")
-        self.browser_status_var.set(self._format_browser_status(report["browser"]))
-        self.ocr_status_var.set(self._format_ocr_status(report["ocr"]))
-        self.uia_status_var.set(self._format_uia_status(report["uia"]))
-        self._set_status("Idle", "Doctor finished. Review the live screen and capability cards before starting a run.")
-        self._append_log(f"[doctor] desktop={self.desktop_status_var.get()} browser={self.browser_status_var.get()} ocr={self.ocr_status_var.get()} uia={self.uia_status_var.get()}")
-        self.refresh_recent_runs()
+        self.start_button.configure(state=tk.DISABLED)
+        self.doctor_button.configure(state=tk.DISABLED)
+        env_file = Path(self.env_entry.get().strip() or self.env_file)
+        self.doctor_worker = threading.Thread(
+            target=self._run_doctor_worker,
+            args=(env_file, auto),
+            daemon=True,
+        )
+        self.doctor_worker.start()
 
     def relaunch_as_admin(self) -> None:
         if self._is_admin():
@@ -591,6 +586,45 @@ class AgentDashboard:
         env_path = Path(self.env_entry.get().strip() or self.env_file)
         return AgentConfig.from_env(env_path if env_path.exists() else None)
 
+    def _schedule_initial_doctor(self) -> None:
+        try:
+            auto_run_doctor = self._load_config().auto_run_doctor
+        except Exception:
+            return
+        if auto_run_doctor:
+            self.root.after(350, lambda: self.run_doctor(auto=True))
+
+    def _doctor_running(self) -> bool:
+        return self.doctor_worker is not None and self.doctor_worker.is_alive()
+
+    def _run_doctor_worker(self, env_file: Path, auto: bool) -> None:
+        runtime: AgentRuntime | None = None
+        try:
+            config = AgentConfig.from_env(env_file if env_file.exists() else None)
+            run_dir = config.runs_dir / f"doctor_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            runtime = AgentRuntime(config=config, run_dir=run_dir)
+            observation = runtime.capture_observation(step=0)
+            report = runtime.doctor_report()
+            self.event_queue.put(
+                {
+                    "type": "doctor_finished",
+                    "run_dir": str(run_dir),
+                    "screenshot_path": str(observation.screenshot_path),
+                    "report": report,
+                }
+            )
+        except Exception as exc:
+            self.event_queue.put(
+                {
+                    "type": "doctor_failed",
+                    "error": str(exc),
+                    "show_dialog": not auto,
+                }
+            )
+        finally:
+            if runtime is not None:
+                runtime.close()
+
     def _drain_events(self) -> None:
         while True:
             try:
@@ -602,6 +636,51 @@ class AgentDashboard:
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type", ""))
+        if event_type == "doctor_finished":
+            self.progress.stop()
+            self.current_run_dir = str(event.get("run_dir", ""))
+            self.current_screenshot_path = str(event.get("screenshot_path", ""))
+            self.run_dir_var.set(self.current_run_dir or "-")
+            report = event.get("report", {})
+            desktop = report.get("desktop", {}) if isinstance(report, dict) else {}
+            self.step_var.set("doctor")
+            self.active_window_var.set(str(desktop.get("active_window") or "<none>"))
+            self._replace_window_list(desktop.get("visible_windows", []))
+            self._render_screenshot(self.current_screenshot_path)
+            self.desktop_status_var.set(
+                f"Ready {desktop.get('screen_width', '?')}x{desktop.get('screen_height', '?')}"
+            )
+            self.browser_status_var.set(
+                self._format_browser_status(report.get("browser", {}))
+            )
+            self.ocr_status_var.set(self._format_ocr_status(report.get("ocr", {})))
+            self.uia_status_var.set(self._format_uia_status(report.get("uia", {})))
+            self._set_status(
+                "Idle",
+                "Doctor finished. Review the live screen and capability cards before starting a run.",
+            )
+            self._append_log(
+                f"[doctor] desktop={self.desktop_status_var.get()} browser={self.browser_status_var.get()} "
+                f"ocr={self.ocr_status_var.get()} uia={self.uia_status_var.get()}"
+            )
+            self.doctor_worker = None
+            if self.worker is None:
+                self.start_button.configure(state=tk.NORMAL)
+                self.doctor_button.configure(state=tk.NORMAL)
+            self.refresh_recent_runs()
+            return
+        if event_type == "doctor_failed":
+            self.progress.stop()
+            error = str(event.get("error", "") or "Doctor failed.")
+            self._set_status("Doctor failed", error)
+            self._append_log(f"[error] doctor failed: {error}")
+            self.doctor_worker = None
+            if self.worker is None:
+                self.start_button.configure(state=tk.NORMAL)
+                self.doctor_button.configure(state=tk.NORMAL)
+            if event.get("show_dialog", True):
+                messagebox.showerror("Doctor failed", error)
+            return
         if event_type == "run_started":
             self.current_run_dir = str(event.get("run_dir", ""))
             self.run_dir_var.set(self.current_run_dir or "-")
@@ -628,14 +707,22 @@ class AgentDashboard:
         if event_type == "assistant_message":
             content = str(event.get("content", "")).strip()
             if content:
-                self._append_live_reply("Assistant", content, "assistant")
+                if event.get("streamed"):
+                    self._set_live_reply("Assistant", content, "assistant")
+                else:
+                    self._append_live_reply("Assistant", content, "assistant")
                 self._append_log(f"[assistant] {content}")
+            return
+        if event_type == "assistant_message_delta":
+            content = str(event.get("content", "")).strip()
+            if content:
+                self._set_live_reply("Assistant", content, "assistant")
             return
         if event_type == "tool_result":
             self._append_log(f"[tool] {event.get('tool_name', '')}\n{json.dumps(event.get('result', {}), ensure_ascii=False, indent=2)}")
             return
         if event_type == "runner_warning":
-            self._append_log(f"[doctor] runner warning: {event.get('warning', '')}")
+            self._append_log(f"[run] warning: {event.get('warning', '')}")
             return
         if event_type != "run_finished":
             return
@@ -716,6 +803,15 @@ class AgentDashboard:
         self.reply_text.see(tk.END)
         self.reply_text.configure(state=tk.DISABLED)
 
+    def _set_live_reply(self, title: str, text: str, tag: str) -> None:
+        self.reply_text.configure(state=tk.NORMAL)
+        self.reply_text.delete("1.0", tk.END)
+        if text.strip():
+            self.reply_text.insert(tk.END, f"{title}\n", f"{tag}_label")
+            self.reply_text.insert(tk.END, text.strip(), f"{tag}_body")
+            self.reply_text.see(tk.END)
+        self.reply_text.configure(state=tk.DISABLED)
+
     def _clear_live_reply(self) -> None:
         self.reply_text.configure(state=tk.NORMAL)
         self.reply_text.delete("1.0", tk.END)
@@ -759,6 +855,9 @@ class AgentDashboard:
     def _on_close(self) -> None:
         if self.worker is not None and self.worker.is_alive():
             if not messagebox.askyesno("Agent still running", "The agent is still running. Close the window anyway?"):
+                return
+        if self._doctor_running():
+            if not messagebox.askyesno("Doctor still running", "Doctor is still collecting diagnostics. Close the window anyway?"):
                 return
         self.root.destroy()
 

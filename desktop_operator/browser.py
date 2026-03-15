@@ -106,6 +106,7 @@ class BrowserManager:
         self._page = None
         self._connected_via = ""
         self._executable_path: str | None = None
+        self._last_snapshot: dict[str, Any] | None = None
 
     def availability(self) -> dict[str, Any]:
         available = sync_playwright is not None
@@ -234,7 +235,9 @@ class BrowserManager:
 
     def snapshot(self, max_elements: int = 20) -> dict[str, Any]:
         page = self._ensure_page()
-        return page.evaluate(DOM_SNAPSHOT_JS, max_elements)
+        snapshot = page.evaluate(DOM_SNAPSHOT_JS, max_elements)
+        self._store_snapshot(snapshot)
+        return snapshot
 
     def click(
         self,
@@ -245,6 +248,7 @@ class BrowserManager:
         exact: bool = False,
         timeout_ms: int | None = None,
     ) -> dict[str, Any]:
+        self._invalidate_snapshot()
         locator = self._resolve_locator(
             selector=selector,
             agent_id=agent_id,
@@ -264,6 +268,7 @@ class BrowserManager:
         clear: bool = True,
         timeout_ms: int | None = None,
     ) -> dict[str, Any]:
+        self._invalidate_snapshot()
         locator = self._resolve_locator(
             selector=selector,
             agent_id=agent_id,
@@ -277,11 +282,13 @@ class BrowserManager:
         return self.status(include_snapshot=True)
 
     def press(self, key: str) -> dict[str, Any]:
+        self._invalidate_snapshot()
         page = self._ensure_page()
         page.keyboard.press(key)
         return self.status(include_snapshot=False)
 
     def scroll(self, delta_x: int = 0, delta_y: int = 900) -> dict[str, Any]:
+        self._invalidate_snapshot()
         page = self._ensure_page()
         page.mouse.wheel(delta_x, delta_y)
         return self.status(include_snapshot=True)
@@ -324,8 +331,46 @@ class BrowserManager:
             self._context = None
             self._page = None
             self._connected_via = ""
+            self._last_snapshot = None
         result["closed"] = True
         return result
+
+    def cached_snapshot_summary(self, max_elements: int = 8) -> str | None:
+        snapshot = self._last_snapshot
+        if not snapshot:
+            return None
+
+        title = str(snapshot.get("title") or "<untitled>")
+        url = str(snapshot.get("url") or "<none>")
+        excerpt = str(snapshot.get("text_excerpt") or "").strip()
+        elements = snapshot.get("elements", [])
+        lines = [
+            "Recent cached DOM snapshot:",
+            f"Cached page: {title}",
+            f"Cached URL: {url}",
+        ]
+        if excerpt:
+            lines.append(f"Cached text excerpt: {excerpt[:320]}")
+
+        dom_lines: list[str] = []
+        if isinstance(elements, list):
+            for element in elements[:max(0, max_elements)]:
+                if not isinstance(element, dict):
+                    continue
+                label = (
+                    element.get("text")
+                    or element.get("aria_label")
+                    or element.get("placeholder")
+                    or ""
+                )
+                dom_lines.append(
+                    f"{element.get('agent_id', '<unknown>')}: <{element.get('tag', '?')}> "
+                    f"{str(label)[:80]} selector={element.get('selector', '<none>')}"
+                )
+        if dom_lines:
+            lines.append("Cached DOM targets: " + " | ".join(dom_lines))
+        lines.append("If the page may have changed, call browser_snapshot for a fresh DOM read.")
+        return "\n".join(lines)
 
     def _ensure_page(self):
         if self._context is None:
@@ -365,6 +410,13 @@ class BrowserManager:
             return page.url
         except Exception:  # pragma: no cover - navigation race
             return "<navigating>"
+
+    def _store_snapshot(self, snapshot: dict[str, Any]) -> None:
+        if isinstance(snapshot, dict):
+            self._last_snapshot = snapshot
+
+    def _invalidate_snapshot(self) -> None:
+        self._last_snapshot = None
 
 
 def browser_tool_definitions() -> list[dict[str, Any]]:

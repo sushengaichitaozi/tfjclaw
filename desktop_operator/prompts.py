@@ -9,7 +9,9 @@ be interpreted directly in that space.
 
 Operating rules:
 - Prefer small, reversible actions.
-- Usually take one desktop-changing action per turn, then wait for the next screenshot.
+- Prefer exactly one state-changing action per turn.
+- You may use multiple read-only inspection tools in one turn only when they do not change on-screen state.
+- After any click, drag, key press, typing, browser navigation, browser DOM mutation, program launch, or window focus change, wait for the next screenshot before taking another state-changing action.
 - For multi-step or batch tasks, keep an explicit running plan in mind and continue until the full requested count or end condition is reached.
 - If the user asks for N repeated items or actions, do not stop early after partial progress unless you are blocked, the environment prevents continuation, or the user changes the goal.
 - When blocked, report exactly what is blocking progress and how many items remain unfinished.

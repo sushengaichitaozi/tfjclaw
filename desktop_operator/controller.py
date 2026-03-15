@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import time
 import webbrowser
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pyautogui
 import pygetwindow as gw
@@ -53,6 +55,7 @@ class DesktopController:
         screenshot_path = self.run_dir / f"step_{step:02d}.png"
         screenshot = pyautogui.screenshot()
         screenshot.save(screenshot_path)
+        self._prune_old_screenshots()
 
         width, height = pyautogui.size()
         cursor_x, cursor_y = pyautogui.position()
@@ -90,7 +93,7 @@ class DesktopController:
         pyautogui.click(x=x, y=y, button=button, clicks=clicks)
         return self._record("click", x=x, y=y, button=button, clicks=clicks)
 
-    def move_mouse(self, x: int, y: int, duration: float = 0.2) -> dict[str, Any]:
+    def move_mouse(self, x: int, y: int, duration: float = 0.08) -> dict[str, Any]:
         x, y = self._clamp_point(x, y)
         if self.config.dry_run:
             return self._record("move_mouse", x=x, y=y, duration=duration, dry_run=True)
@@ -99,7 +102,7 @@ class DesktopController:
         return self._record("move_mouse", x=x, y=y, duration=duration)
 
     def drag_mouse(
-        self, x: int, y: int, duration: float = 0.2, button: str = "left"
+        self, x: int, y: int, duration: float = 0.12, button: str = "left"
     ) -> dict[str, Any]:
         x, y = self._clamp_point(x, y)
         if self.config.dry_run:
@@ -179,14 +182,19 @@ class DesktopController:
         return self._record("wait", seconds=seconds, dry_run=self.config.dry_run)
 
     def open_url(self, url: str) -> dict[str, Any]:
+        normalized = url.strip()
+        validation = self._validate_url(normalized)
+        if validation is not None:
+            return self._record("open_url", url=url, blocked=True, reason=validation)
+
         if self.config.dry_run:
-            return self._record("open_url", url=url, dry_run=True)
+            return self._record("open_url", url=normalized, dry_run=True)
 
         if hasattr(os, "startfile"):
-            os.startfile(url)
+            os.startfile(normalized)
         else:
-            webbrowser.open(url)
-        return self._record("open_url", url=url)
+            webbrowser.open(normalized)
+        return self._record("open_url", url=normalized)
 
     def launch_program(self, command: str) -> dict[str, Any]:
         if not self.config.allow_shell_launch:
@@ -198,40 +206,60 @@ class DesktopController:
             )
 
         if self.config.dry_run:
-            return self._record("launch_program", command=command, dry_run=True)
+            validated = self._prepare_launch_command(command)
+            if "reason" in validated:
+                return self._record(
+                    "launch_program",
+                    command=command,
+                    blocked=True,
+                    reason=validated["reason"],
+                )
+            return self._record(
+                "launch_program",
+                command=command,
+                argv=validated["argv"],
+                dry_run=True,
+            )
 
-        process = subprocess.Popen(command, shell=True)
-        return self._record("launch_program", command=command, pid=process.pid)
+        validated = self._prepare_launch_command(command)
+        if "reason" in validated:
+            return self._record(
+                "launch_program",
+                command=command,
+                blocked=True,
+                reason=validated["reason"],
+            )
+
+        process = subprocess.Popen(validated["argv"], shell=False)
+        return self._record(
+            "launch_program",
+            command=command,
+            argv=validated["argv"],
+            pid=process.pid,
+        )
 
     def list_windows(self, limit: int = 20) -> dict[str, Any]:
         titles = self._list_window_titles(limit=limit)
         return self._record("list_windows", titles=titles, limit=limit)
 
     def focus_window(self, title_substring: str) -> dict[str, Any]:
-        matches = []
-        lowered = title_substring.lower()
-
-        for window in gw.getAllWindows():
-            title = (window.title or "").strip()
-            if not title:
-                continue
-            if lowered in title.lower():
-                matches.append(window)
-
-        if not matches:
+        target, candidate_titles = self._select_window_match(title_substring)
+        if target is None:
             return self._record(
                 "focus_window",
                 title_substring=title_substring,
                 found=False,
+                candidate_count=0,
             )
 
-        target = matches[0]
         if self.config.dry_run:
             return self._record(
                 "focus_window",
                 title_substring=title_substring,
                 found=True,
                 target=target.title,
+                candidate_count=len(candidate_titles),
+                candidates=candidate_titles[:5],
                 dry_run=True,
             )
 
@@ -239,7 +267,7 @@ class DesktopController:
             if target.isMinimized:
                 target.restore()
             target.activate()
-            time.sleep(0.2)
+            time.sleep(0.1)
             outcome = self._focus_outcome(
                 title_substring=title_substring,
                 target_title=target.title,
@@ -253,6 +281,8 @@ class DesktopController:
                 error=str(exc),
             )
 
+        outcome["candidate_count"] = len(candidate_titles)
+        outcome["candidates"] = candidate_titles[:5]
         if not outcome.get("focused", False):
             fallback = self._focus_window_uia(target.title or title_substring)
             if fallback.get("focused", False):
@@ -263,6 +293,8 @@ class DesktopController:
                     "focused": True,
                     "method": "uia",
                     "fallback": True,
+                    "candidate_count": len(candidate_titles),
+                    "candidates": candidate_titles[:5],
                 }
             elif fallback.get("error"):
                 outcome = {
@@ -272,6 +304,8 @@ class DesktopController:
                     "focused": False,
                     "method": "pygetwindow",
                     "error": outcome.get("error") or fallback["error"],
+                    "candidate_count": len(candidate_titles),
+                    "candidates": candidate_titles[:5],
                 }
 
         return self._record("focus_window", **outcome)
@@ -325,6 +359,23 @@ class DesktopController:
         width, height = pyautogui.size()
         return max(0, min(int(x), width - 1)), max(0, min(int(y), height - 1))
 
+    def _prune_old_screenshots(self) -> None:
+        if self.config.max_saved_screenshots <= 0:
+            return
+
+        screenshots = sorted(
+            self.run_dir.glob("step_*.png"),
+            key=lambda path: int(path.stem.split("_")[-1]),
+        )
+        if len(screenshots) <= self.config.max_saved_screenshots:
+            return
+
+        for old_path in screenshots[: -self.config.max_saved_screenshots]:
+            try:
+                old_path.unlink()
+            except OSError:  # pragma: no cover - depends on filesystem state
+                pass
+
     def _choose_input_mode(self, text: str, method: str) -> str:
         if method in {"type", "paste"}:
             return method
@@ -352,17 +403,190 @@ class DesktopController:
     ) -> dict[str, Any]:
         active_title = self._get_active_window_title().lower()
         normalized_target = target_title.strip().lower()
-        focused = normalized_target in active_title or active_title in normalized_target
+        focused = bool(active_title) and (
+            normalized_target in active_title or active_title in normalized_target
+        )
         outcome = {
             "title_substring": title_substring,
             "found": True,
             "target": target_title,
             "focused": focused,
             "method": method,
+            "candidate_count": 1,
         }
         if error:
             outcome["error"] = error
         return outcome
+
+    def _select_window_match(self, title_substring: str) -> tuple[Any | None, list[str]]:
+        normalized_query = title_substring.strip().lower()
+        if not normalized_query:
+            return None, []
+
+        scored_matches: list[tuple[tuple[int, int, int], Any, str]] = []
+        active_title = self._get_active_window_title().lower()
+
+        for window in gw.getAllWindows():
+            title = (window.title or "").strip()
+            if not title:
+                continue
+
+            lowered = title.lower()
+            if normalized_query not in lowered:
+                continue
+
+            if lowered == normalized_query:
+                match_rank = 3
+            elif lowered.startswith(normalized_query):
+                match_rank = 2
+            else:
+                match_rank = 1
+
+            minimized_penalty = 1 if getattr(window, "isMinimized", False) else 0
+            active_bonus = 1 if lowered == active_title else 0
+            score = (
+                match_rank,
+                active_bonus,
+                -minimized_penalty,
+                -abs(len(lowered) - len(normalized_query)),
+            )
+            scored_matches.append((score, window, title))
+
+        if not scored_matches:
+            return None, []
+
+        scored_matches.sort(key=lambda item: item[0], reverse=True)
+        candidate_titles = [title for _, _, title in scored_matches]
+        return scored_matches[0][1], candidate_titles
+
+    def _prepare_launch_command(self, command: str) -> dict[str, Any]:
+        normalized = command.strip()
+        if not normalized:
+            return {"reason": "Command is empty."}
+
+        if any(token in normalized for token in ("&&", "||", "|", ">", "<", ";")):
+            return {
+                "reason": "Shell metacharacters are blocked. Launch a direct executable instead.",
+            }
+
+        try:
+            argv = shlex.split(normalized, posix=False)
+        except ValueError as exc:
+            return {"reason": f"Command could not be parsed: {exc}"}
+
+        if not argv:
+            return {"reason": "Command is empty."}
+
+        executable = argv[0].strip().strip('"')
+        if not executable:
+            return {"reason": "Command is empty."}
+
+        allowlisted = self._command_matches_allowed_prefixes(argv)
+        if self.config.allowed_launch_prefixes and not allowlisted:
+            return {
+                "reason": (
+                    "Command is not in DESKTOP_AGENT_ALLOWED_COMMAND_PREFIXES. "
+                    f"Allowed prefixes: {', '.join(self.config.allowed_launch_prefixes)}"
+                )
+            }
+
+        if self._is_high_risk_launcher(executable) and not allowlisted:
+            return {
+                "reason": (
+                    "High-risk launchers and script hosts are blocked unless allowlisted in "
+                    "DESKTOP_AGENT_ALLOWED_COMMAND_PREFIXES."
+                )
+            }
+
+        return {"argv": argv}
+
+    def _command_matches_allowed_prefixes(self, argv: list[str]) -> bool:
+        if not argv:
+            return False
+
+        for raw_prefix in self.config.allowed_launch_prefixes:
+            prefix = raw_prefix.strip()
+            if not prefix:
+                continue
+            try:
+                prefix_argv = shlex.split(prefix, posix=False)
+            except ValueError:
+                continue
+            if not prefix_argv or len(prefix_argv) > len(argv):
+                continue
+
+            if not self._executables_match(prefix_argv[0], argv[0]):
+                continue
+
+            if all(
+                self._normalize_argument_token(prefix_argv[index])
+                == self._normalize_argument_token(argv[index])
+                for index in range(1, len(prefix_argv))
+            ):
+                return True
+        return False
+
+    def _validate_url(self, url: str) -> str | None:
+        if not url:
+            return "URL is empty."
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"}:
+            return "Only http and https URLs are allowed."
+        if not parsed.netloc:
+            return "URL must include a network location."
+        return None
+
+    def _executables_match(self, allowed_executable: str, actual_executable: str) -> bool:
+        allowed_token = allowed_executable.strip().strip('"')
+        actual_token = actual_executable.strip().strip('"')
+        if not allowed_token or not actual_token:
+            return False
+
+        if self._token_has_path(allowed_token):
+            return self._normalize_path_token(allowed_token) == self._normalize_path_token(
+                actual_token
+            )
+        return Path(actual_token).name.lower() == Path(allowed_token).name.lower()
+
+    def _normalize_argument_token(self, token: str) -> str:
+        return token.strip().strip('"').lower()
+
+    def _normalize_path_token(self, token: str) -> str:
+        expanded = os.path.expandvars(token.strip().strip('"'))
+        return str(Path(expanded).expanduser()).lower()
+
+    def _token_has_path(self, token: str) -> bool:
+        stripped = token.strip().strip('"')
+        return bool(Path(stripped).anchor) or "\\" in stripped or "/" in stripped
+
+    def _is_high_risk_launcher(self, executable: str) -> bool:
+        executable_name = Path(executable).name.lower()
+        if executable_name in {
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+            "wscript",
+            "wscript.exe",
+            "cscript",
+            "cscript.exe",
+            "mshta",
+            "mshta.exe",
+            "python",
+            "python.exe",
+        }:
+            return True
+        return Path(executable).suffix.lower() in {
+            ".bat",
+            ".cmd",
+            ".ps1",
+            ".vbs",
+            ".js",
+            ".wsf",
+        }
 
     def _focus_window_uia(self, title_substring: str) -> dict[str, Any]:
         if Desktop is None:
@@ -375,7 +599,7 @@ class DesktopController:
                 if not title or lowered not in title.lower():
                     continue
                 window.set_focus()
-                time.sleep(0.2)
+                time.sleep(0.1)
                 return {
                     "focused": title.lower() in self._get_active_window_title().lower(),
                     "target": title,

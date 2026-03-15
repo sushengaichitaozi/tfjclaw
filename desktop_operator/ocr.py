@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,8 @@ class OcrEngine:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         if self.config.tesseract_cmd:
             pytesseract.pytesseract.tesseract_cmd = self.config.tesseract_cmd
+        if self.config.tessdata_prefix:
+            os.environ["TESSDATA_PREFIX"] = str(self.config.tessdata_prefix)
 
     def status(self) -> dict[str, Any]:
         try:
@@ -26,6 +29,7 @@ class OcrEngine:
             return {
                 "available": True,
                 "tesseract_cmd": pytesseract.pytesseract.tesseract_cmd,
+                "tessdata_prefix": os.environ.get("TESSDATA_PREFIX", ""),
                 "version": version,
                 "default_lang": self.config.ocr_lang,
             }
@@ -33,6 +37,7 @@ class OcrEngine:
             return {
                 "available": False,
                 "tesseract_cmd": pytesseract.pytesseract.tesseract_cmd,
+                "tessdata_prefix": os.environ.get("TESSDATA_PREFIX", ""),
                 "error": str(exc),
             }
 
@@ -122,7 +127,8 @@ class OcrEngine:
         region: list[int] | None = None,
     ) -> Image.Image:
         if image_path:
-            return Image.open(image_path)
+            with Image.open(image_path) as image:
+                return image.copy()
         if region:
             left, top, width, height = region
             return pyautogui.screenshot(region=(left, top, width, height))

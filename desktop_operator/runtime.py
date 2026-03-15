@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from .browser import BrowserManager, browser_tool_definitions
 from .config import AgentConfig
@@ -55,7 +58,7 @@ def desktop_tool_definitions() -> list[dict[str, Any]]:
                     "properties": {
                         "x": {"type": "integer"},
                         "y": {"type": "integer"},
-                        "duration": {"type": "number", "default": 0.2},
+                        "duration": {"type": "number", "default": 0.08},
                     },
                     "required": ["x", "y"],
                 },
@@ -71,7 +74,7 @@ def desktop_tool_definitions() -> list[dict[str, Any]]:
                     "properties": {
                         "x": {"type": "integer"},
                         "y": {"type": "integer"},
-                        "duration": {"type": "number", "default": 0.2},
+                        "duration": {"type": "number", "default": 0.12},
                         "button": {
                             "type": "string",
                             "enum": ["left", "right", "middle"],
@@ -221,6 +224,8 @@ class AgentRuntime:
         self.ocr = OcrEngine(config=config, run_dir=run_dir / "ocr")
         self.uia = UIAutomationBridge(config=config)
         self.latest_observation: Observation | None = None
+        self._uia_cache_key: tuple[str, tuple[int, int, int, int] | None] | None = None
+        self._uia_cache_section = ""
         self._tool_map = {
             "click": lambda arguments: self.controller.click(**arguments),
             "move_mouse": lambda arguments: self.controller.move_mouse(**arguments),
@@ -267,19 +272,48 @@ class AgentRuntime:
         )
 
     def execute_tool_call(self, tool_name: str, raw_arguments: str) -> dict[str, Any]:
-        arguments = json.loads(raw_arguments or "{}")
         if tool_name not in self._tool_map:
             return {"error": f"Unknown tool: {tool_name}"}
+
+        try:
+            arguments = json.loads(raw_arguments or "{}")
+        except json.JSONDecodeError as exc:
+            return {
+                "error": f"Invalid JSON arguments: {exc.msg}",
+                "tool_name": tool_name,
+                "raw_arguments": raw_arguments,
+            }
+
+        if not isinstance(arguments, dict):
+            return {
+                "error": "Tool arguments must decode to a JSON object.",
+                "tool_name": tool_name,
+                "arguments": arguments,
+            }
 
         try:
             return self._tool_map[tool_name](arguments)
         except Exception as exc:  # pragma: no cover - depends on runtime
             return {"error": str(exc), "tool_name": tool_name, "arguments": arguments}
 
+    def close(self) -> dict[str, Any]:
+        result = {"browser_closed": False}
+        try:
+            if (
+                getattr(self.browser, "_context", None) is not None
+                or getattr(self.browser, "_playwright", None) is not None
+            ):
+                browser_result = self.browser.close()
+                result["browser_closed"] = bool(browser_result.get("closed"))
+        except Exception as exc:  # pragma: no cover - depends on runtime
+            result["browser_close_error"] = str(exc)
+        return result
+
     def build_visual_message(self, step: int, observation: Observation) -> dict[str, Any]:
         sections: list[str] = [
             f"Current step: {step}",
             f"Screen size: {observation.width}x{observation.height}",
+            "Screenshot mapping: the attached screenshot is sent without spatial resizing, so coordinates map 1:1 to screen pixels.",
             f"Cursor: ({observation.cursor_x}, {observation.cursor_y})",
             f"Active window: {observation.active_window or '<none>'}",
             f"Visible windows: {', '.join(observation.visible_windows) or '<none>'}",
@@ -302,21 +336,29 @@ class AgentRuntime:
                 f"left={bounds['left']} top={bounds['top']} width={bounds['width']} height={bounds['height']}"
             )
 
-        browser_status = self.browser.status(
-            include_snapshot=self.browser.availability().get("connected", False),
-            max_elements=self.config.max_browser_elements,
-        )
+        browser_status = self.browser.status(include_snapshot=False)
         sections.append(self._format_browser_section(browser_status))
+        cached_browser_snapshot = self.browser.cached_snapshot_summary(
+            max_elements=min(8, self.config.max_browser_elements)
+        )
+        if cached_browser_snapshot:
+            sections.append(cached_browser_snapshot)
 
-        if self.config.include_uia_in_prompt and observation.active_window:
+        should_include_uia = (
+            self.config.include_uia_in_prompt
+            and observation.active_window
+            and observation.active_window not in browser_windows
+        )
+        if should_include_uia:
             sections.append(
-                self._format_uia_section(
-                    self.uia.describe_window(
-                        title_substring=observation.active_window,
-                        depth=1,
-                        limit=10,
-                    )
+                self._uia_section_for_window(
+                    observation.active_window,
+                    observation.active_window_bounds,
                 )
+            )
+        elif observation.active_window and observation.active_window in browser_windows:
+            sections.append(
+                "Windows UI Automation prompt dump skipped for the active browser window. Use browser_snapshot for DOM inspection first."
             )
         else:
             sections.append(
@@ -436,23 +478,8 @@ class AgentRuntime:
             f"Browser page: {browser_status.get('title') or '<untitled>'}",
             f"Browser URL: {browser_status.get('url') or '<none>'}",
             f"Browser tabs: {tabs_summary}",
+            "Call browser_snapshot when you need a fresh DOM target list.",
         ]
-        snapshot = browser_status.get("snapshot")
-        if snapshot:
-            elements = snapshot.get("elements", [])
-            dom_lines = []
-            for element in elements[: self.config.max_browser_elements]:
-                label = (
-                    element.get("text")
-                    or element.get("aria_label")
-                    or element.get("placeholder")
-                    or ""
-                )
-                dom_lines.append(
-                    f"{element['agent_id']}: <{element['tag']}> {label[:80]} selector={element['selector']}"
-                )
-            if dom_lines:
-                lines.append("Visible DOM targets: " + " | ".join(dom_lines))
         return "\n".join(lines)
 
     def _format_uia_section(self, uia_status: dict[str, Any]) -> str:
@@ -470,7 +497,46 @@ class AgentRuntime:
             )
         return "Windows UI Automation controls: " + " | ".join(control_lines)
 
+    def _uia_section_for_window(
+        self,
+        title: str,
+        bounds: dict[str, int] | None = None,
+    ) -> str:
+        normalized = title.strip()
+        bounds_key = None
+        if bounds:
+            bounds_key = (
+                int(bounds.get("left", 0)),
+                int(bounds.get("top", 0)),
+                int(bounds.get("width", 0)),
+                int(bounds.get("height", 0)),
+            )
+        cache_key = (normalized, bounds_key)
+
+        if normalized and cache_key == self._uia_cache_key and self._uia_cache_section:
+            return self._uia_cache_section
+
+        section = self._format_uia_section(
+            self.uia.describe_window(
+                title_substring=normalized,
+                depth=1,
+                limit=10,
+            )
+        )
+        self._uia_cache_key = cache_key
+        self._uia_cache_section = section
+        return section
+
     def _image_path_to_data_url(self, path: Path) -> str:
-        mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        return f"data:{mime_type};base64,{encoded}"
+        with Image.open(path) as image:
+            rendered = image.convert("RGB")
+            buffer = io.BytesIO()
+            rendered.save(
+                buffer,
+                format="JPEG",
+                quality=self.config.prompt_image_quality,
+                optimize=True,
+            )
+
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
